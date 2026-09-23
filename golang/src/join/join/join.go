@@ -2,7 +2,10 @@ package join
 
 import (
 	"log/slog"
+	"sort"
 
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
 
@@ -19,8 +22,10 @@ type JoinConfig struct {
 }
 
 type Join struct {
-	inputQueue  middleware.Middleware
-	outputQueue middleware.Middleware
+	inputQueue         middleware.Middleware
+	outputQueue        middleware.Middleware
+	clientFruitItemMap map[uint64]map[string]fruititem.FruitItem
+	topSize            int
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -37,7 +42,7 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{inputQueue: inputQueue, outputQueue: outputQueue}, nil
+	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, topSize: config.TopSize, clientFruitItemMap: make(map[uint64]map[string]fruititem.FruitItem)}, nil
 }
 
 func (join *Join) Run() {
@@ -46,9 +51,63 @@ func (join *Join) Run() {
 	})
 }
 
-func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack()
-	if err := join.outputQueue.Send(msg); err != nil {
-		slog.Error("While sending top", "err", err)
+func (join *Join) handleMessage(msg middleware.Message, ack, nack func()) {
+	client_id, fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	if err != nil {
+		slog.Debug("While deserializing message", "err", err)
+		nack()
+		return
+	}
+	if isEof {
+		if err := join.handleEndOfRecordsMessage(client_id); err != nil {
+			slog.Error("While handling end of record message", "err", err)
+		}
+		return
+	}
+	join.handleDataMessage(client_id, fruitRecords)
+}
+
+func (join *Join) handleEndOfRecordsMessage(client_id uint64) error {
+	slog.Info("Received End Of Records message")
+
+	fruitTopRecords := join.buildFruitTop(client_id)
+	message, err := inner.SerializeMessage(client_id, fruitTopRecords)
+	if err != nil {
+		slog.Debug("While serializing top message", "err", err)
+		return err
+	}
+	if err := join.outputQueue.Send(*message); err != nil {
+		slog.Debug("While sending top message", "err", err)
+		return err
+	}
+	return nil
+}
+
+func (join *Join) buildFruitTop(client_id uint64) []fruititem.FruitItem {
+	fruitItems := make([]fruititem.FruitItem, 0, len(join.clientFruitItemMap[client_id]))
+	for _, item := range join.clientFruitItemMap[client_id] {
+		fruitItems = append(fruitItems, item)
+	}
+	sort.SliceStable(fruitItems, func(i, j int) bool {
+		return fruitItems[j].Less(fruitItems[i])
+	})
+	finalTopSize := min(join.topSize, len(fruitItems))
+	return fruitItems[:finalTopSize]
+}
+
+func (join *Join) handleDataMessage(clientID uint64, fruitRecords []fruititem.FruitItem) {
+
+	if _, exists := join.clientFruitItemMap[clientID]; !exists {
+		join.clientFruitItemMap[clientID] = make(map[string]fruititem.FruitItem)
+	}
+
+	fruitMap := join.clientFruitItemMap[clientID]
+
+	for _, fruitRecord := range fruitRecords {
+		if _, ok := fruitMap[fruitRecord.Fruit]; ok {
+			fruitMap[fruitRecord.Fruit] = fruitMap[fruitRecord.Fruit].Sum(fruitRecord)
+		} else {
+			fruitMap[fruitRecord.Fruit] = fruitRecord
+		}
 	}
 }

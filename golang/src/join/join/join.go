@@ -25,7 +25,9 @@ type Join struct {
 	inputQueue         middleware.Middleware
 	outputQueue        middleware.Middleware
 	clientFruitItemMap map[uint64]map[string]fruititem.FruitItem
+	clientCompletedMap map[uint64]int
 	topSize            int
+	aggregationAmount  int
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -42,7 +44,14 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{inputQueue: inputQueue, outputQueue: outputQueue, topSize: config.TopSize, clientFruitItemMap: make(map[uint64]map[string]fruititem.FruitItem)}, nil
+	return &Join{
+		inputQueue:         inputQueue,
+		outputQueue:        outputQueue,
+		topSize:            config.TopSize,
+		clientFruitItemMap: make(map[uint64]map[string]fruititem.FruitItem),
+		clientCompletedMap: make(map[uint64]int),
+		aggregationAmount:  config.AggregationAmount,
+	}, nil
 }
 
 func (join *Join) Run() {
@@ -70,15 +79,21 @@ func (join *Join) handleMessage(msg middleware.Message, ack, nack func()) {
 func (join *Join) handleEndOfRecordsMessage(client_id uint64) error {
 	slog.Info("Received End Of Records message")
 
-	fruitTopRecords := join.buildFruitTop(client_id)
-	message, err := inner.SerializeMessage(client_id, fruitTopRecords)
-	if err != nil {
-		slog.Debug("While serializing top message", "err", err)
-		return err
-	}
-	if err := join.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending top message", "err", err)
-		return err
+	join.clientCompletedMap[client_id]++
+
+	if join.clientCompletedMap[client_id] == join.aggregationAmount {
+
+		fruitTopRecords := join.buildFruitTop(client_id)
+		message, err := inner.SerializeMessage(client_id, fruitTopRecords)
+		if err != nil {
+			slog.Debug("While serializing top message", "err", err)
+			return err
+		}
+		if err := join.outputQueue.Send(*message); err != nil {
+			slog.Debug("While sending top message", "err", err)
+			return err
+		}
+		return nil
 	}
 	return nil
 }

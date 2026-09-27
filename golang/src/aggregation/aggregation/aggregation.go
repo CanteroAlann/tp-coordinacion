@@ -25,7 +25,9 @@ type AggregationConfig struct {
 type Aggregation struct {
 	outputQueue        middleware.Middleware
 	inputExchange      middleware.Middleware
+	sumAmount          int
 	clientFruitItemMap map[uint64]map[string]fruititem.FruitItem
+	clientCompletedMap map[uint64]int
 	topSize            int
 }
 
@@ -47,7 +49,9 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	return &Aggregation{
 		outputQueue:        outputQueue,
 		inputExchange:      inputExchange,
+		sumAmount:          config.SumAmount,
 		clientFruitItemMap: map[uint64]map[string]fruititem.FruitItem{},
+		clientCompletedMap: map[uint64]int{},
 		topSize:            config.TopSize,
 	}, nil
 }
@@ -80,26 +84,30 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 func (aggregation *Aggregation) handleEndOfRecordsMessage(client_id uint64) error {
 	slog.Info("Received End Of Records message")
 
-	fruitTopRecords := aggregation.buildFruitTop(client_id)
-	message, err := inner.SerializeMessage(client_id, fruitTopRecords)
-	if err != nil {
-		slog.Debug("While serializing top message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending top message", "err", err)
-		return err
-	}
+	aggregation.clientCompletedMap[client_id]++
 
-	eofMessage := []fruititem.FruitItem{}
-	message, err = inner.SerializeMessage(client_id, eofMessage)
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
+	if aggregation.clientCompletedMap[client_id] == aggregation.sumAmount {
+
+		fruitTopRecords := aggregation.buildFruitTop(client_id)
+		message, err := inner.SerializeMessage(client_id, fruitTopRecords)
+		if err != nil {
+			slog.Debug("While serializing top message", "err", err)
+			return err
+		}
+		if err := aggregation.outputQueue.Send(*message); err != nil {
+			slog.Debug("While sending top message", "err", err)
+			return err
+		}
+
+		message, err = inner.SerializeEOFMessage(client_id, 0)
+		if err != nil {
+			slog.Debug("While serializing EOF message", "err", err)
+			return err
+		}
+		if err := aggregation.outputQueue.Send(*message); err != nil {
+			slog.Debug("While sending EOF message", "err", err)
+			return err
+		}
 	}
 	return nil
 }

@@ -30,7 +30,7 @@ func NewRabbitMQExchange(exchange string, keys []string, settings ConnSettings) 
 
 	err = ch.ExchangeDeclare(
 		exchange, // name
-		"direct", // type
+		"fanout", // type
 		false,    // durable
 		false,    // auto-deleted
 		false,    // internal
@@ -162,11 +162,11 @@ func (r *RabbitMQExchange) Send(msg Message) error {
 
 	ch := r.conn.GetChannel()
 
-	for _, key := range r.keys {
+	for range r.keys {
 		err := ch.PublishWithContext(
 			ctx,
 			r.exchange, // exchange
-			key,        // routing key
+			"",         // routing key
 			false,      // mandatory
 			false,      // immediate
 			amqp.Publishing{

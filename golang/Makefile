@@ -21,6 +21,10 @@ test:
 	rm ./output/* -f
 	COMPOSE_HTTP_TIMEOUT=300 docker compose -f docker-compose.yaml up --build --remove-orphans --detach
 	go run ./verify_output.go; EXIT_CODE=$$?; \
+	if [ $$EXIT_CODE -ne 0 ]; then \
+		echo "El test falló. Guardando logs en error_logs.txt..."; \
+		docker compose -f docker-compose.yaml logs --no-color > error_logs.txt; \
+	fi; \
 	docker compose -f docker-compose.yaml stop -t 5; \
 	docker compose -f docker-compose.yaml down; \
 	exit $$EXIT_CODE

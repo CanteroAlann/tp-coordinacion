@@ -60,7 +60,7 @@ services:
       - sum_1
       - sum_2
     environment:
-      - INPUT_FILE=/datasets/input_test_0.csv
+      - INPUT_FILE=/datasets/input_0.csv
       - OUTPUT_FILE=/output/output_0.csv
       - SERVER_HOST=gateway
       - SERVER_PORT=5678
@@ -77,7 +77,7 @@ services:
       - sum_1
       - sum_2
     environment:
-      - INPUT_FILE=/datasets/input_test_1.csv
+      - INPUT_FILE=/datasets/input_1.csv
       - OUTPUT_FILE=/output/output_1.csv
       - SERVER_HOST=gateway
       - SERVER_PORT=5678
@@ -94,7 +94,7 @@ services:
       - sum_1
       - sum_2
     environment:
-      - INPUT_FILE=/datasets/input_test_2.csv
+      - INPUT_FILE=/datasets/input_2.csv
       - OUTPUT_FILE=/output/output_2.csv
       - SERVER_HOST=gateway
       - SERVER_PORT=5678

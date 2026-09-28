@@ -30,7 +30,7 @@ func NewRabbitMQExchange(exchange string, keys []string, settings ConnSettings) 
 
 	err = ch.ExchangeDeclare(
 		exchange, // name
-		"fanout", // type
+		"direct", // type
 		false,    // durable
 		false,    // auto-deleted
 		false,    // internal
@@ -162,11 +162,11 @@ func (r *RabbitMQExchange) Send(msg Message) error {
 
 	ch := r.conn.GetChannel()
 
-	for range r.keys {
+	for _, key := range r.keys {
 		err := ch.PublishWithContext(
 			ctx,
 			r.exchange, // exchange
-			"",         // routing key
+			key,        // routing key
 			false,      // mandatory
 			false,      // immediate
 			amqp.Publishing{
@@ -180,6 +180,36 @@ func (r *RabbitMQExchange) Send(msg Message) error {
 			}
 			return ErrMessageMiddlewareMessage
 		}
+	}
+
+	return nil
+}
+
+func (r *RabbitMQExchange) SendTo(topic string, msg Message) error {
+	if r.conn.IsClosed() {
+		return ErrMessageMiddlewareDisconnected
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ch := r.conn.GetChannel()
+	err := ch.PublishWithContext(
+		ctx,
+		r.exchange, // exchange
+		topic,      // routing key
+		false,      // mandatory
+		false,      // immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(msg.Body),
+		},
+	)
+	if err != nil {
+		if err == amqp.ErrClosed {
+			return ErrMessageMiddlewareDisconnected
+		}
+		return ErrMessageMiddlewareMessage
 	}
 
 	return nil

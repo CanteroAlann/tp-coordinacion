@@ -130,6 +130,10 @@ func (aggregation *Aggregation) handleDataMessage(clientID uint64, fruitRecords 
 }
 
 func (aggregation *Aggregation) buildFruitTop(client_id uint64) []fruititem.FruitItem {
+	fruitMap, exists := aggregation.clientFruitItemMap[client_id]
+	if !exists || len(fruitMap) == 0 {
+		return []fruititem.FruitItem{}
+	}
 	fruitItems := make([]fruititem.FruitItem, 0, len(aggregation.clientFruitItemMap[client_id]))
 	for _, item := range aggregation.clientFruitItemMap[client_id] {
 		fruitItems = append(fruitItems, item)

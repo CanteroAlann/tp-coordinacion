@@ -81,6 +81,39 @@ func (r *RabbitMQQueue) Send(msg Message) error {
 	return nil
 }
 
+func (r *RabbitMQQueue) SendTo(topic string, msg Message) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	if r.conn.IsClosed() {
+		return ErrMessageMiddlewareDisconnected
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ch := r.conn.GetChannel()
+
+	err := ch.PublishWithContext(
+		ctx,
+		"",
+		topic,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(msg.Body),
+		},
+	)
+	if err != nil {
+		if err == amqp.ErrClosed {
+			return ErrMessageMiddlewareDisconnected
+		}
+		return ErrMessageMiddlewareMessage
+	}
+	return nil
+}
+
 func (r *RabbitMQQueue) StartConsuming(callbackFunc func(msg Message, ack func(), nack func())) error {
 	r.lock.Lock()
 	if r.conn.IsClosed() {

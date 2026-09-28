@@ -39,6 +39,8 @@ type Middleware interface {
 	//Si ocurre un error interno que no puede resolverse devuelve ErrMessageMiddlewareMessage.
 	Send(msg Message) error
 
+	SendTo(topic string, msg Message) error
+
 	//Se desconecta de la cola o exchange al que estaba conectado.
 	//Si ocurre un error interno que no puede resolverse devuelve ErrMessageMiddlewareClose.
 	Close() error

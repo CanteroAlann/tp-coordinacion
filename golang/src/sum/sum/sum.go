@@ -3,6 +3,7 @@ package sum
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -51,6 +52,8 @@ type Sum struct {
 	reportedMessagesByClient  map[uint64]map[int]uint64
 	mu                        sync.Mutex
 	iAmCoordinator            bool
+	aggregationAmount         int
+	aggregationPrefix         string
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -91,6 +94,8 @@ func NewSum(config SumConfig) (*Sum, error) {
 		processedMessagesByClient: map[uint64]uint64{},
 		reportedMessagesByClient:  map[uint64]map[int]uint64{},
 		iAmCoordinator:            false,
+		aggregationAmount:         config.AggregationAmount,
+		aggregationPrefix:         config.AggregationPrefix,
 	}, nil
 }
 
@@ -274,20 +279,25 @@ func (sum *Sum) flushAndSendEOF(clientID uint64) error {
 			slog.Debug("While serializing message", "err", err)
 			return err
 		}
-		if err := sum.outputExchange.Send(*message); err != nil {
-			slog.Debug("While sending message", "err", err)
+		h := fnv.New32a()
+		h.Write([]byte(fruitItem.Fruit))
+		targetID := int(h.Sum32()) % sum.aggregationAmount
+		routingKey := fmt.Sprintf("%s_%d", sum.aggregationPrefix, targetID)
+		if err := sum.outputExchange.SendTo(routingKey, *message); err != nil {
 			return err
 		}
 	}
 
-	message, err := inner.SerializeEOFMessage(clientID, sum.processedMessagesByClient[clientID])
+	eofMessage, err := inner.SerializeEOFMessage(clientID, sum.processedMessagesByClient[clientID])
 	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
 		return err
 	}
-	if err := sum.outputExchange.Send(*message); err != nil {
-		slog.Debug("While sending EOF message to aggregation", "err", err)
-		return err
+
+	for i := range sum.aggregationAmount {
+		routingKey := fmt.Sprintf("%s_%d", sum.aggregationPrefix, i)
+		if err := sum.outputExchange.SendTo(routingKey, *eofMessage); err != nil {
+			return err
+		}
 	}
 
 	return nil

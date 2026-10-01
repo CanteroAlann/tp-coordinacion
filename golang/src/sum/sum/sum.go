@@ -11,6 +11,8 @@ import (
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
 
+const BatchFlushThreshold = 2000
+
 type SumConfig struct {
 	Id                int
 	MomHost           string
@@ -22,27 +24,17 @@ type SumConfig struct {
 	AggregationPrefix string
 }
 
-type ControlPayload struct {
-	Type          ControlMsgType `json:"type"`
-	ClientID      uint64         `json:"client_id"`
-	SenderID      int            `json:"sender_id"`
-	TotalExpected uint64         `json:"total_expected,omitempty"`
-	Count         uint64         `json:"count,omitempty"`
-}
-
 type Sum struct {
-	id                        int
-	inputQueue                middleware.Middleware
-	outputExchange            middleware.Middleware
-	coordinator               *Coordinator
-	clientFruitItemMap        map[uint64]map[string]fruititem.FruitItem
-	completedClients          map[uint64]bool
-	processedMessagesByClient map[uint64]uint64
-	reportedMessagesByClient  map[uint64]map[int]uint64
-	mu                        sync.Mutex
-	iAmCoordinator            bool
-	aggregationAmount         int
-	aggregationPrefix         string
+	id                      int
+	inputQueue              middleware.Middleware
+	outputExchange          middleware.Middleware
+	coordinator             *Coordinator
+	clientFruitItemMap      map[uint64]map[string]fruititem.FruitItem
+	completedClients        map[uint64]bool
+	clientPendingItemsCount map[uint64]int
+	mu                      sync.Mutex
+	aggregationAmount       int
+	aggregationPrefix       string
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -65,13 +57,14 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 
 	sumInstance := &Sum{
-		id:                 config.Id,
-		inputQueue:         inputQueue,
-		outputExchange:     outputExchange,
-		clientFruitItemMap: map[uint64]map[string]fruititem.FruitItem{},
-		completedClients:   map[uint64]bool{},
-		aggregationAmount:  config.AggregationAmount,
-		aggregationPrefix:  config.AggregationPrefix,
+		id:                      config.Id,
+		inputQueue:              inputQueue,
+		outputExchange:          outputExchange,
+		clientFruitItemMap:      map[uint64]map[string]fruititem.FruitItem{},
+		completedClients:        map[uint64]bool{},
+		clientPendingItemsCount: map[uint64]int{},
+		aggregationAmount:       config.AggregationAmount,
+		aggregationPrefix:       config.AggregationPrefix,
 	}
 
 	coordinator, err := newCoordinator(config.Id, connSettings, config.SumPrefix, sumInstance.flushAndSendEOF)
@@ -115,7 +108,6 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 
 func (sum *Sum) handleDataMessage(clientID uint64, fruitRecords []fruititem.FruitItem) error {
 	sum.mu.Lock()
-	defer sum.mu.Unlock()
 
 	sum.coordinator.AddProcessedCount(clientID)
 
@@ -131,6 +123,49 @@ func (sum *Sum) handleDataMessage(clientID uint64, fruitRecords []fruititem.Frui
 			fruitMap[fruitRecord.Fruit] = fruitRecord
 		}
 	}
+	sum.clientPendingItemsCount[clientID] += len(fruitRecords)
+
+	var itemsToFlush map[string]fruititem.FruitItem
+	if sum.clientPendingItemsCount[clientID] >= BatchFlushThreshold {
+		itemsToFlush = sum.clientFruitItemMap[clientID]
+		sum.clientFruitItemMap[clientID] = make(map[string]fruititem.FruitItem)
+		sum.clientPendingItemsCount[clientID] = 0
+	}
+	sum.mu.Unlock()
+
+	if len(itemsToFlush) > 0 {
+		return sum.sendBatchItems(clientID, itemsToFlush)
+	}
+
+	return nil
+}
+
+func (sum *Sum) sendBatchItems(clientID uint64, items map[string]fruititem.FruitItem) error {
+	partitionBatches := make(map[int][]fruititem.FruitItem)
+
+	for _, item := range items {
+		h := fnv.New32a()
+		h.Write([]byte(item.Fruit))
+		targetID := int(h.Sum32()) % sum.aggregationAmount
+		partitionBatches[targetID] = append(partitionBatches[targetID], item)
+	}
+
+	for targetID, records := range partitionBatches {
+		if len(records) == 0 {
+			continue
+		}
+		message, err := inner.SerializeMessage(clientID, records)
+		if err != nil {
+			slog.Error("While serializing batch message", "err", err)
+			return err
+		}
+
+		routingKey := fmt.Sprintf("%s_%d", sum.aggregationPrefix, targetID)
+		if err := sum.outputExchange.SendTo(routingKey, *message); err != nil {
+			slog.Error("While sending batch message", "err", err)
+			return err
+		}
+	}
 	return nil
 }
 
@@ -142,26 +177,18 @@ func (sum *Sum) flushAndSendEOF(clientID uint64) error {
 	}
 	sum.completedClients[clientID] = true
 
-	fruitMap := sum.clientFruitItemMap[clientID]
+	remainingMap := sum.clientFruitItemMap[clientID]
 	delete(sum.clientFruitItemMap, clientID)
+	delete(sum.clientPendingItemsCount, clientID)
 	sum.mu.Unlock()
 
-	for _, fruitItem := range fruitMap {
-		message, err := inner.SerializeMessage(clientID, []fruititem.FruitItem{fruitItem})
-		if err != nil {
-			slog.Debug("While serializing message", "err", err)
-			return err
-		}
-		h := fnv.New32a()
-		h.Write([]byte(fruitItem.Fruit))
-		targetID := int(h.Sum32()) % sum.aggregationAmount
-		routingKey := fmt.Sprintf("%s_%d", sum.aggregationPrefix, targetID)
-		if err := sum.outputExchange.SendTo(routingKey, *message); err != nil {
+	if len(remainingMap) > 0 {
+		if err := sum.sendBatchItems(clientID, remainingMap); err != nil {
 			return err
 		}
 	}
 
-	eofMessage, err := inner.SerializeEOFMessage(clientID, sum.processedMessagesByClient[clientID])
+	eofMessage, err := inner.SerializeEOFMessage(clientID, 0)
 	if err != nil {
 		return err
 	}

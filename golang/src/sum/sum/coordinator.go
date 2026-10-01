@@ -24,9 +24,16 @@ type Coordinator struct {
 	controlExchange           middleware.Middleware
 	reportedMessagesByClient  map[uint64]map[int]uint64
 	processedMessagesByClient map[uint64]uint64
-	iAmLeader                 bool
 	mu                        sync.Mutex
 	onFlushCallback           func(clientID uint64) error
+}
+
+type ControlPayload struct {
+	Type          ControlMsgType `json:"type"`
+	ClientID      uint64         `json:"client_id"`
+	SenderID      int            `json:"sender_id"`
+	TotalExpected uint64         `json:"total_expected,omitempty"`
+	Count         uint64         `json:"count,omitempty"`
 }
 
 func newCoordinator(id int, connSettings middleware.ConnSettings, sumPrefix string, onFlushCallback func(clientID uint64) error) (*Coordinator, error) {
@@ -42,7 +49,6 @@ func newCoordinator(id int, connSettings middleware.ConnSettings, sumPrefix stri
 		controlExchange:           controlExchange,
 		reportedMessagesByClient:  map[uint64]map[int]uint64{},
 		processedMessagesByClient: map[uint64]uint64{},
-		iAmLeader:                 false,
 		onFlushCallback:           onFlushCallback,
 	}, nil
 }
@@ -68,18 +74,22 @@ func (coordinator *Coordinator) handleControlMessage(payload ControlPayload) {
 	switch payload.Type {
 	case MsgAnnounceEOF:
 
+		if payload.SenderID == coordinator.id {
+			return
+		}
+
+		coordinator.mu.Lock()
+		count := coordinator.processedMessagesByClient[payload.ClientID]
+		coordinator.mu.Unlock()
+
 		report := ControlPayload{
 			Type:     MsgReportCount,
 			ClientID: payload.ClientID,
 			SenderID: coordinator.id,
-			Count:    coordinator.processedMessagesByClient[payload.ClientID],
+			Count:    count,
 		}
 		bytes, _ := json.Marshal(report)
 		_ = coordinator.controlExchange.Send(middleware.Message{Body: string(bytes)})
-
-		if payload.SenderID == coordinator.id && !coordinator.iAmLeader {
-			go coordinator.waitForAllProcessed(payload.ClientID, payload.TotalExpected)
-		}
 
 	case MsgReportCount:
 		if _, exists := coordinator.reportedMessagesByClient[payload.ClientID]; !exists {
@@ -104,10 +114,10 @@ func (coordinator *Coordinator) coordinateEOF(clientID uint64, totalExpected uin
 	}
 	bytes, _ := json.Marshal(announce)
 	_ = coordinator.controlExchange.Send(middleware.Message{Body: string(bytes)})
+	go coordinator.waitForAllProcessed(clientID, totalExpected)
 }
 
 func (coordinator *Coordinator) waitForAllProcessed(clientID uint64, totalExpected uint64) {
-	//logger.Info("Waiting for all processed messages", logger.InProgress, "client_id", clientID, "total_expected", totalExpected, "coordinator_id", sum.id)
 
 	for {
 		coordinator.mu.Lock()

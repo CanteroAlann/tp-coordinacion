@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/sum"
 )
@@ -63,6 +66,10 @@ func loadConfig() (sum.SumConfig, error) {
 }
 
 func run() int {
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	config, err := loadConfig()
 	if err != nil {
 		slog.Error("While loading config", "err", err)
@@ -74,8 +81,12 @@ func run() int {
 		slog.Error("While initializing sum", "err", err)
 		return 1
 	}
+	defer server.Close()
 
-	server.Run()
+	if err := server.Run(ctx); err != nil {
+		slog.Error("Service terminated with error", "err", err)
+		return 1
+	}
 	return 0
 }
 

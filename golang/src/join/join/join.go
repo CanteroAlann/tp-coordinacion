@@ -1,6 +1,7 @@
 package join
 
 import (
+	"context"
 	"log/slog"
 	"sort"
 
@@ -54,10 +55,23 @@ func NewJoin(config JoinConfig) (*Join, error) {
 	}, nil
 }
 
-func (join *Join) Run() {
-	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		join.handleMessage(msg, ack, nack)
-	})
+func (join *Join) Run(ctx context.Context) error {
+	consumeErrChan := make(chan error, 1)
+	go func() {
+		err := join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			join.handleMessage(msg, ack, nack)
+		})
+		consumeErrChan <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		slog.Info("Shutting down Join node gracefully...")
+		join.Close()
+		return nil
+	case err := <-consumeErrChan:
+		return err
+	}
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack, nack func()) {
@@ -93,6 +107,8 @@ func (join *Join) handleEndOfRecordsMessage(client_id uint64) error {
 			slog.Debug("While sending top message", "err", err)
 			return err
 		}
+		join.cleanupClientState(client_id)
+
 		return nil
 	}
 	return nil
@@ -125,4 +141,15 @@ func (join *Join) handleDataMessage(clientID uint64, fruitRecords []fruititem.Fr
 			fruitMap[fruitRecord.Fruit] = fruitRecord
 		}
 	}
+}
+
+func (join *Join) cleanupClientState(clientID uint64) {
+	delete(join.clientFruitItemMap, clientID)
+	delete(join.clientCompletedMap, clientID)
+}
+
+func (join *Join) Close() {
+	_ = join.inputQueue.StopConsuming()
+	_ = join.inputQueue.Close()
+	_ = join.outputQueue.Close()
 }

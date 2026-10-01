@@ -1,6 +1,7 @@
 package aggregation
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -56,12 +57,24 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	}, nil
 }
 
-func (aggregation *Aggregation) Run() {
-	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		aggregation.handleMessage(msg, ack, nack)
-	})
-}
+func (aggregation *Aggregation) Run(ctx context.Context) error {
+	consumeErrChan := make(chan error, 1)
+	go func() {
+		err := aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			aggregation.handleMessage(msg, ack, nack)
+		})
+		consumeErrChan <- err
+	}()
 
+	select {
+	case <-ctx.Done():
+		slog.Info("Shutting down Aggregation node gracefully...")
+		aggregation.Close()
+		return nil
+	case err := <-consumeErrChan:
+		return err
+	}
+}
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
@@ -108,6 +121,7 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(client_id uint64) erro
 			slog.Debug("While sending EOF message", "err", err)
 			return err
 		}
+		aggregation.cleanupClientState(client_id)
 	}
 	return nil
 }
@@ -143,4 +157,15 @@ func (aggregation *Aggregation) buildFruitTop(client_id uint64) []fruititem.Frui
 	})
 	finalTopSize := min(aggregation.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
+}
+
+func (aggregation *Aggregation) cleanupClientState(clientID uint64) {
+	delete(aggregation.clientFruitItemMap, clientID)
+	delete(aggregation.clientCompletedMap, clientID)
+}
+
+func (aggregation *Aggregation) Close() {
+	_ = aggregation.inputExchange.StopConsuming()
+	_ = aggregation.inputExchange.Close()
+	_ = aggregation.outputQueue.Close()
 }

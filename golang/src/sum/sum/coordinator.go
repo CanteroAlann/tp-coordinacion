@@ -1,11 +1,11 @@
 package sum
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
-	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/logger"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
@@ -24,8 +24,14 @@ type Coordinator struct {
 	controlExchange           middleware.Middleware
 	reportedMessagesByClient  map[uint64]map[int]uint64
 	processedMessagesByClient map[uint64]uint64
+	expectedMessagesByClient  map[uint64]uint64
 	mu                        sync.Mutex
+	isEOFAnnounced            map[uint64]bool
+	completedClients          map[uint64]bool
 	onFlushCallback           func(clientID uint64) error
+	ctx                       context.Context
+	cancel                    context.CancelFunc
+	wg                        sync.WaitGroup
 }
 
 type ControlPayload struct {
@@ -44,17 +50,28 @@ func newCoordinator(id int, connSettings middleware.ConnSettings, sumPrefix stri
 		controlExchange.Close()
 		return nil, err
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
 	return &Coordinator{
 		id:                        id,
 		controlExchange:           controlExchange,
 		reportedMessagesByClient:  map[uint64]map[int]uint64{},
 		processedMessagesByClient: map[uint64]uint64{},
-		onFlushCallback:           onFlushCallback,
+		expectedMessagesByClient:  map[uint64]uint64{},
+		isEOFAnnounced:            map[uint64]bool{},
+		completedClients:          map[uint64]bool{},
+
+		onFlushCallback: onFlushCallback,
+		ctx:             ctx,
+		cancel:          cancel,
 	}, nil
 }
 
 func (coordinator *Coordinator) Run() {
+	coordinator.wg.Add(1)
 	go func() {
+		defer coordinator.wg.Done()
 		err := coordinator.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 			defer ack()
 			var payload ControlPayload
@@ -79,32 +96,44 @@ func (coordinator *Coordinator) handleControlMessage(payload ControlPayload) {
 		}
 
 		coordinator.mu.Lock()
+		coordinator.isEOFAnnounced[payload.ClientID] = true
 		count := coordinator.processedMessagesByClient[payload.ClientID]
 		coordinator.mu.Unlock()
 
-		report := ControlPayload{
-			Type:     MsgReportCount,
-			ClientID: payload.ClientID,
-			SenderID: coordinator.id,
-			Count:    count,
-		}
-		bytes, _ := json.Marshal(report)
-		_ = coordinator.controlExchange.Send(middleware.Message{Body: string(bytes)})
+		coordinator.sendReportCount(payload.ClientID, count)
 
 	case MsgReportCount:
+		coordinator.mu.Lock()
 		if _, exists := coordinator.reportedMessagesByClient[payload.ClientID]; !exists {
 			coordinator.reportedMessagesByClient[payload.ClientID] = make(map[int]uint64)
 		}
-
 		coordinator.reportedMessagesByClient[payload.ClientID][payload.SenderID] = payload.Count
+
+		totalExpected, isCoordinating := coordinator.expectedMessagesByClient[payload.ClientID]
+		coordinator.mu.Unlock()
+
+		if isCoordinating {
+			coordinator.tryCommitFlush(payload.ClientID, totalExpected)
+		}
+
 	case MsgCommitFlush:
 		if err := coordinator.onFlushCallback(payload.ClientID); err != nil {
 			slog.Error("While executing commit flush", "err", err)
 		}
+		coordinator.cleanupClientState(payload.ClientID)
 	}
 }
 
 func (coordinator *Coordinator) coordinateEOF(clientID uint64, totalExpected uint64) {
+	coordinator.mu.Lock()
+	coordinator.expectedMessagesByClient[clientID] = totalExpected
+	coordinator.isEOFAnnounced[clientID] = true
+
+	if _, exists := coordinator.reportedMessagesByClient[clientID]; !exists {
+		coordinator.reportedMessagesByClient[clientID] = make(map[int]uint64)
+	}
+	coordinator.reportedMessagesByClient[clientID][coordinator.id] = coordinator.processedMessagesByClient[clientID]
+	coordinator.mu.Unlock()
 
 	announce := ControlPayload{
 		Type:          MsgAnnounceEOF,
@@ -114,49 +143,70 @@ func (coordinator *Coordinator) coordinateEOF(clientID uint64, totalExpected uin
 	}
 	bytes, _ := json.Marshal(announce)
 	_ = coordinator.controlExchange.Send(middleware.Message{Body: string(bytes)})
-	go coordinator.waitForAllProcessed(clientID, totalExpected)
+
+	coordinator.tryCommitFlush(clientID, totalExpected)
 }
 
-func (coordinator *Coordinator) waitForAllProcessed(clientID uint64, totalExpected uint64) {
+func (coordinator *Coordinator) tryCommitFlush(clientID uint64, totalExpected uint64) {
+	coordinator.mu.Lock()
 
-	for {
-		coordinator.mu.Lock()
-		if _, exists := coordinator.reportedMessagesByClient[clientID]; !exists {
-			coordinator.reportedMessagesByClient[clientID] = make(map[int]uint64)
+	if coordinator.completedClients[clientID] {
+		return
+	}
+	totalAccum := uint64(0)
+	for _, count := range coordinator.reportedMessagesByClient[clientID] {
+		totalAccum += count
+	}
+	coordinator.mu.Unlock()
+
+	if totalAccum >= totalExpected {
+		logger.Info("All messages processed, sending commit flush", logger.Success, "client_id", clientID, "totalAccum", totalAccum, "totalExpected", totalExpected)
+		commit := ControlPayload{
+			Type:     MsgCommitFlush,
+			ClientID: clientID,
 		}
-		coordinator.reportedMessagesByClient[clientID][coordinator.id] = coordinator.processedMessagesByClient[clientID]
-
-		totalAccum := uint64(0)
-		for _, count := range coordinator.reportedMessagesByClient[clientID] {
-			totalAccum += count
-		}
-		coordinator.mu.Unlock()
-
-		if totalAccum >= totalExpected {
-			logger.Info("All messages processed, sending commit flush", logger.Success, "client_id", clientID, "totalAccum", totalAccum, "totalExpected", totalExpected)
-			commit := ControlPayload{
-				Type:     MsgCommitFlush,
-				ClientID: clientID,
-			}
-			bytes, _ := json.Marshal(commit)
-			_ = coordinator.controlExchange.Send(middleware.Message{Body: string(bytes)})
-			return
-		}
-
-		time.Sleep(15 * time.Millisecond)
-
-		announce := ControlPayload{
-			Type:          MsgAnnounceEOF,
-			ClientID:      clientID,
-			SenderID:      coordinator.id,
-			TotalExpected: totalExpected,
-		}
-		bytes, _ := json.Marshal(announce)
+		bytes, _ := json.Marshal(commit)
 		_ = coordinator.controlExchange.Send(middleware.Message{Body: string(bytes)})
 	}
 }
+
+func (coordinator *Coordinator) sendReportCount(clientID uint64, count uint64) {
+	report := ControlPayload{
+		Type:     MsgReportCount,
+		ClientID: clientID,
+		SenderID: coordinator.id,
+		Count:    count,
+	}
+	bytes, _ := json.Marshal(report)
+	_ = coordinator.controlExchange.Send(middleware.Message{Body: string(bytes)})
+}
+
 func (coordinator *Coordinator) AddProcessedCount(clientID uint64) {
 	coordinator.mu.Lock()
-	defer coordinator.mu.Unlock()
 	coordinator.processedMessagesByClient[clientID]++
+	count := coordinator.processedMessagesByClient[clientID]
+
+	isAnnounced := coordinator.isEOFAnnounced[clientID]
+	coordinator.mu.Unlock()
+
+	if isAnnounced {
+		coordinator.sendReportCount(clientID, count)
+	}
+}
+
+func (coordinator *Coordinator) cleanupClientState(clientID uint64) {
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	delete(coordinator.reportedMessagesByClient, clientID)
+	delete(coordinator.processedMessagesByClient, clientID)
+	delete(coordinator.expectedMessagesByClient, clientID)
+	delete(coordinator.isEOFAnnounced, clientID)
+	delete(coordinator.completedClients, clientID)
+}
+
+func (coordinator *Coordinator) Close() {
+	coordinator.cancel()
+	_ = coordinator.controlExchange.StopConsuming()
+	coordinator.wg.Wait()
+	_ = coordinator.controlExchange.Close()
 }

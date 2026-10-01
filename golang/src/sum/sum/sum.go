@@ -1,6 +1,7 @@
 package sum
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -78,11 +79,25 @@ func NewSum(config SumConfig) (*Sum, error) {
 	return sumInstance, nil
 }
 
-func (sum *Sum) Run() {
+func (sum *Sum) Run(ctx context.Context) error {
 	sum.coordinator.Run()
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleMessage(msg, ack, nack)
-	})
+
+	consumeErrChan := make(chan error, 1)
+	go func() {
+		err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleMessage(msg, ack, nack)
+		})
+		consumeErrChan <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		slog.Info("Shutting down Sum node gracefully...")
+		sum.Close()
+		return nil
+	case err := <-consumeErrChan:
+		return err
+	}
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -96,7 +111,7 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 
 	switch packet.Type {
 	case inner.PacketTypeEOF:
-		go sum.coordinator.coordinateEOF(packet.ClientID, packet.TotalMsgs)
+		sum.coordinator.coordinateEOF(packet.ClientID, packet.TotalMsgs)
 	case inner.PacketTypeData:
 		if err := sum.handleDataMessage(packet.ClientID, packet.Records); err != nil {
 			slog.Error("While handling data message", "err", err)
@@ -178,8 +193,6 @@ func (sum *Sum) flushAndSendEOF(clientID uint64) error {
 	sum.completedClients[clientID] = true
 
 	remainingMap := sum.clientFruitItemMap[clientID]
-	delete(sum.clientFruitItemMap, clientID)
-	delete(sum.clientPendingItemsCount, clientID)
 	sum.mu.Unlock()
 
 	if len(remainingMap) > 0 {
@@ -199,6 +212,28 @@ func (sum *Sum) flushAndSendEOF(clientID uint64) error {
 			return err
 		}
 	}
+	sum.cleanupClientState(clientID)
 
 	return nil
+}
+
+func (sum *Sum) cleanupClientState(clientID uint64) {
+	sum.mu.Lock()
+	defer sum.mu.Unlock()
+
+	delete(sum.clientFruitItemMap, clientID)
+	delete(sum.completedClients, clientID)
+	delete(sum.clientPendingItemsCount, clientID)
+}
+
+func (sum *Sum) Close() {
+	sum.mu.Lock()
+	defer sum.mu.Unlock()
+
+	_ = sum.inputQueue.StopConsuming()
+	_ = sum.inputQueue.Close()
+
+	sum.coordinator.Close()
+
+	_ = sum.outputExchange.Close()
 }
